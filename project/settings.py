@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -92,6 +93,15 @@ DATABASES = {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'rag.sqlite3',
     },
+        # External SQL database (configured via environment variables)
+        'external': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.getenv('EXTERNAL_DB_NAME'),
+            'USER': os.getenv('EXTERNAL_DB_USER'),
+            'PASSWORD': os.getenv('EXTERNAL_DB_PASSWORD'),
+            'HOST': os.getenv('EXTERNAL_DB_HOST'),
+            'PORT': os.getenv('EXTERNAL_DB_PORT', '5432'),
+        },
     'development': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
         'NAME': 'rag_development',
@@ -154,6 +164,11 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 OPENAI_API_KEY = 'sk-...'  # Replace with your actual OpenAI API key
 
+# Qdrant cloud configuration
+QDRANT_URL = 'https://c0e31b36-e7d2-456b-aeb0-1f867c6752db.us-east-1-0.aws.cloud.qdrant.io'
+QDRANT_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.77c3xH89QXk7NsFm1rXG76efMdOY3wofz8J_zs2KBLU'
+QDRANT_COLLECTION_NAME = 'user_uploaded_files'
+
 SECURE_CROSS_ORIGIN_OPENER_POLICY=None
 
 # Value determines whether the server allows cookies in the cross-site HTTP requests
@@ -201,3 +216,6 @@ CORS_ALLOWED_ORIGINS = [
     "http://103.116.37.147",
     "http://103.116.37.148"
 ]
+
+# Route ExternalDocument to external DB
+DATABASE_ROUTERS = ['rag.db_router.ExternalDbRouter']

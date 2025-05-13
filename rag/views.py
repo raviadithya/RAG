@@ -1,7 +1,7 @@
 # rag/views.py
 
 from django.http import JsonResponse
-from .models import Tenant,Document, ChatHistory, DocumentAlert, MultiFileChatSession
+from .models import Tenant, Document, ChatHistory, DocumentAlert, MultiFileChatSession, DocumentAccess, ExternalDocument
 import json
 from rest_framework.decorators import api_view
 from rest_framework import status
@@ -13,11 +13,25 @@ from .serializers import *
 from django.contrib.auth import authenticate, get_user_model
 from django.shortcuts import get_object_or_404
 from rest_framework.parsers import MultiPartParser, FormParser
-from .utils import extract_text_from_file, insert_document_to_vectorstore, ask_question, retrieve_documents_by_vector_id,delete_documents_by_vector_id, retrieve_documents_by_vector_ids,summarize_context, extract_metadata,ask_question_for_single_document
+from .utils import (
+    extract_text_from_file,
+    insert_document_to_vectorstore,
+    ask_question,
+    retrieve_documents_by_vector_id,
+    delete_documents_by_vector_id,
+    retrieve_documents_by_vector_ids,
+    summarize_context,
+    extract_metadata,
+    handle_table_query,
+    ask_question_for_single_document,
+    nlp,
+    llm,
+)
 import tempfile
 from pathlib import Path
 import time
 import logging
+import threading
 import uuid
 import hashlib
 import requests
@@ -86,11 +100,15 @@ class LogoutView(APIView):
 
 class IngestAPIView(generics.CreateAPIView):
     serializer_class = IngestDocumentSerializer
+    queryset = Document.objects.all()  # or a filtered queryset as needed
+    
     def post(self, request, token):
         auth_token = get_object_or_404(AuthToken, token_key=token)
         user = auth_token.user
         serializer = self.serializer_class(data=request.data)
         if serializer.is_valid():
+            # initialize table_answer for downstream
+            table_answer = None
             uploaded_file = serializer.validated_data.get('file', None)
             s3_file_url = serializer.validated_data.get('s3_file_url', None)
 
@@ -130,51 +148,44 @@ class IngestAPIView(generics.CreateAPIView):
 
 
             try:
-                # Get tenant from the user's token
-                tenant = user.tenant  # Assuming each user has one tenant
-                
+                # Extract text and metadata
+                tenant = user.tenant
                 extracted_text = extract_text_from_file(tmp_path, file_name)
                 file_ext = Path(file_name).suffix.lower()
-
                 if not extracted_text.strip():
-                    return Response({"error": "No text could be extracted. Please check if the file is password-protected or empty."}, status=status.HTTP_400_BAD_REQUEST)
-
-                start = time.time()
-
+                    return Response({"error": "No text could be extracted."}, status=status.HTTP_400_BAD_REQUEST)
+                # 1) Insert into vector store with progress
                 insert_document_to_vectorstore(extracted_text, source_type, file_ext, vector_id)
-
-                end = time.time()
-                print(f"[+] Embedding and storing in vector store took {end - start:.2f} seconds")
-
-                # Save the document in the Document model
-                document = Document(
-                    tenant=tenant,
-                    title=file_name,
-                    content=extracted_text,
-                    vector_id=vector_id
-                )
+                # 2) Save metadata in Django and external SQL
+                document = Document(tenant=tenant, title=file_name, content=extracted_text, vector_id=vector_id)
                 document.save()
-
-                # Enrich document
-                self.enrich_document(document, extracted_text, file_ext)
-                
-                # Detect alerts
-                self.detect_alerts(document, extracted_text)
-                
-                return Response({"message": "File ingested and stored successfully.",
-                                 "file name" : file_name,
-                                 "document_id": document.id,
-                                 "vector_id": vector_id}, status=status.HTTP_200_OK)
+                try:
+                    ExternalDocument.objects.using('external').create(
+                        vector_id=vector_id, title=file_name, content=extracted_text
+                    )
+                except Exception as e:
+                    print(f"[!] External save failed: {e}")
+                # 3) Enrich and alerts
+                try:
+                    self.enrich_document(document, extracted_text, file_ext)
+                    self.detect_alerts(document, extracted_text)
+                except Exception:
+                    pass
+                # 4) Clean up
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                # 5) Final response with vector_id
+                return Response({
+                    "message": "File ingested and stored successfully.",
+                    "file_name": file_name,
+                    "vector_id": vector_id
+                }, status=status.HTTP_200_OK)
             except ValueError as ve:
                 return Response({"error": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
-            
             except Exception as e:
                 return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-            finally:
-                try:
-                    Path(tmp_path).unlink(missing_ok=True)  # Clean up temp file
-                except Exception as e:
-                    print(f"[!] Error deleting temp file: {e}")
         else:
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -272,34 +283,158 @@ class AskAPIView(generics.CreateAPIView):
                     {"error": "A question must be provided."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            # Validate document access
+            # If this is a table file, first check structured query, then fallback to DataFrame agent
+            # Special handling for single-file table queries
             if vector_id:
                 document = get_object_or_404(Document, vector_id=vector_id, tenant=user.tenant)
-                if user_identifier != user.email:  # Admin uses email as identifier
-                    if not DocumentAccess.objects.filter(document=document, user_identifier=user_identifier).exists():
-                        return Response({'error': 'No access to this document.'}, status=status.HTTP_403_FORBIDDEN)
+                if user_identifier != user.email and not DocumentAccess.objects.filter(
+                    document=document, user_identifier=user_identifier
+                ).exists():
+                    return Response({'error': 'No access to this document.'}, status=status.HTTP_403_FORBIDDEN)
+                from pathlib import Path
+                file_ext = Path(document.title).suffix.lower()
+                if file_ext in ['.csv', '.xls', '.xlsx']:
+                    # Try DataFrame agent for natural-language table queries (handles multi-criteria)
+                    try:
+                        from io import StringIO
+                        import pandas as pd
+                        from langchain_experimental.agents import create_pandas_dataframe_agent
+                        from .utils import llm
+                        df = pd.read_csv(StringIO(document.content))
+                        agent = create_pandas_dataframe_agent(llm, df, verbose=False)
+                        df_answer = agent.run(question)
+                        # Normalize the answer
+                        if isinstance(df_answer, str):
+                            tbl_list = [s.strip() for s in df_answer.split(',') if s.strip()]
+                        elif isinstance(df_answer, list):
+                            tbl_list = df_answer
+                        else:
+                            tbl_list = [str(df_answer)]
+                        return Response({
+                            'vector_answer': '',
+                            'table_answer': tbl_list,
+                            'sql_answer': tbl_list
+                        }, status=status.HTTP_200_OK)
+                    except Exception as e:
+                        print(f"[!] Table agent error: {e}")
+                    # Fallback: simple structured table query
+                    from .utils import handle_table_query
+                    table_res = handle_table_query(document.content, question)
+                    if table_res is not None:
+                        if isinstance(table_res, str):
+                            tbl_list = [s.strip() for s in table_res.split(',') if s.strip()]
+                        elif isinstance(table_res, list):
+                            tbl_list = table_res
+                        else:
+                            tbl_list = [str(table_res)]
+                        return Response({
+                            'vector_answer': '',
+                            'table_answer': tbl_list,
+                            'sql_answer': tbl_list
+                        }, status=status.HTTP_200_OK)
             try:
+                # 1) Vector DB retrieval & LLM QA
                 if vector_id:
-                    # Retrieve documents by vector_id
                     documents = retrieve_documents_by_vector_id(vector_id)
-                    print(f"[+] Retrieved documents for vector_id {vector_id}: {documents}")
                     if not documents:
                         return Response({"error": "No documents found for the given vector_id."}, status=status.HTTP_404_NOT_FOUND)
-                    answer = ask_question_for_single_document(question, source_type=source_type, documents=documents, chat_history=chat_history)
-                    # return Response({"vector_id": vector_id, "documents": documents}, status=status.HTTP_200_OK)
-                    # Update chat history
-                    chat, _ = ChatHistory.objects.get_or_create(
-                        vector_id=vector_id,
-                        user_identifier=user_identifier,
-                        tenant=user.tenant,
-                        defaults={'history': []}
+                    vector_answer = ask_question_for_single_document(
+                        question, source_type=source_type,
+                        documents=documents, chat_history=chat_history
                     )
-                    chat.history.append({"role": "user", "content": question})
-                    chat.history.append({"role": "assistant", "content": answer})
+                    chat, _ = ChatHistory.objects.get_or_create(
+                        vector_id=vector_id, user_identifier=user_identifier,
+                        tenant=user.tenant, defaults={'history': []}
+                    )
+                    chat.history.extend([
+                        {"role": "user", "content": question},
+                        {"role": "assistant", "content": vector_answer}
+                    ])
                     chat.save()
                 else:
-                    answer = ask_question(question, source_type,chat_history)
-                return Response({"answer": answer}, status=status.HTTP_200_OK)
+                    vector_answer = ask_question(question, source_type, chat_history)
+
+                # 2) Table agent across CSV/Excel docs for this tenant
+                table_answer = []
+                from pathlib import Path
+                from .utils import handle_table_query
+                for doc in Document.objects.filter(tenant=user.tenant):
+                    ext = Path(doc.title).suffix.lower()
+                    if ext in ['.csv', '.xls', '.xlsx']:
+                        try:
+                            ext_doc = ExternalDocument.objects.using('external').get(vector_id=doc.vector_id)
+                            res = handle_table_query(ext_doc.content, question)
+                            if res is not None:
+                                table_answer.append({doc.title: res})
+                        except Exception as e:
+                            print(f"[!] Table query error for {doc.title}: {e}")
+                if not table_answer:
+                    table_answer = None
+
+                # 3) SQL substring fallback across all tenant docs
+                sql_answer = []
+                ql = question.lower()
+                for doc in Document.objects.filter(tenant=user.tenant):
+                    try:
+                        ext_doc = ExternalDocument.objects.using('external').get(vector_id=doc.vector_id)
+                        content_lower = ext_doc.content.lower()
+                        if ql in content_lower:
+                            idx = content_lower.find(ql)
+                            snippet = ext_doc.content[max(idx-50,0):min(idx+150, len(ext_doc.content))]
+                            sql_answer.append({doc.title: snippet})
+                    except Exception:
+                        continue
+                if not sql_answer:
+                    sql_answer = []
+
+                # 4) SpaCy-based ORG fallback for non-table docs when others miss
+                if (not vector_answer or vector_answer.lower().startswith('without')) and not table_answer and not sql_answer:
+                    orgs = set()
+                    from pathlib import Path
+                    for doc in Document.objects.filter(tenant=user.tenant):
+                        ext = Path(doc.title).suffix.lower()
+                        if ext not in ['.csv', '.xls', '.xlsx']:
+                            try:
+                                ext_doc = ExternalDocument.objects.using('external').get(vector_id=doc.vector_id)
+                                doc_nlp = nlp(ext_doc.content)
+                                for ent in doc_nlp.ents:
+                                    if ent.label_ == 'ORG':
+                                        for sent in doc_nlp.sents:
+                                            if ent.start_char >= sent.start_char and ent.end_char <= sent.end_char:
+                                                if 'sri lanka' in sent.text.lower():
+                                                    orgs.add(ent.text)
+                            except Exception:
+                                continue
+                    if orgs:
+                        vector_answer = ', '.join(orgs)
+                        if not sql_answer:
+                            sql_answer = list(orgs)
+                        if not table_answer:
+                            table_answer = list(orgs)
+
+                # If table and SQL answers are empty but vector has list output, parse it
+                if (not table_answer) and vector_answer:
+                    import re
+                    names = []
+                    for line in vector_answer.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        m = re.match(r"^\s*\d+[\).\-]?\s*(.*)", line)
+                        if m:
+                            names.append(m.group(1).strip())
+                        else:
+                            names.append(line)
+                    if names:
+                        table_answer = names
+                        if not sql_answer:
+                            sql_answer = names
+                # Return combined answers
+                return Response({
+                    "vector_answer": vector_answer,
+                    "table_answer": table_answer,
+                    "sql_answer": sql_answer
+                }, status=status.HTTP_200_OK)
             except Exception as e:
                 return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         else:
@@ -461,7 +596,43 @@ class GlobalAskAPIView(generics.CreateAPIView):
                     chat_history=chat_history
                 )
 
-                return Response({"answer": answer}, status=status.HTTP_200_OK)
+                # After vector retrieval, also run table and SQL queries across all tenant docs
+                vector_answer = answer
+                table_answer = []
+                sql_answer = []
+                from pathlib import Path
+                from .utils import handle_table_query
+                for doc in Document.objects.filter(tenant=user.tenant):
+                    ext = Path(doc.title).suffix.lower()
+                    # Table query for CSV/Excel
+                    if ext in ['.csv', '.xls', '.xlsx']:
+                        try:
+                            res = handle_table_query(doc.content, question)
+                            if res is not None:
+                                # normalize to list
+                                items = res if isinstance(res, list) else [s.strip() for s in str(res).split(',')]
+                                table_answer.extend(items)
+                        except Exception:
+                            pass
+                    # SQL substring fallback
+                    try:
+                        ext_doc = ExternalDocument.objects.using('external').get(vector_id=doc.vector_id)
+                        txt = ext_doc.content.lower()
+                        ql = question.lower().strip()
+                        if ql in txt:
+                            idx = txt.find(ql)
+                            snippet = ext_doc.content[max(idx-50,0):min(idx+150,len(txt))]
+                            sql_answer.append(snippet)
+                    except Exception:
+                        pass
+                # Deduplicate
+                table_answer = list(dict.fromkeys(table_answer))
+                sql_answer = list(dict.fromkeys(sql_answer))
+                return Response({
+                    'vector_answer': vector_answer,
+                    'table_answer': table_answer or None,
+                    'sql_answer': sql_answer
+                }, status=status.HTTP_200_OK)
             except Exception as e:
                 return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

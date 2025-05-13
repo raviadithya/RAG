@@ -18,9 +18,14 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, MatchAny, MatchValue
 import time
+import time
 from sentence_transformers import SentenceTransformer
 from langchain.schema import Document as LangChainDocument  # <-- Rename it
 import json
+import re
+import difflib
+import pandas as pd
+from io import StringIO
 import xml.etree.ElementTree as ET
 
 from langchain.retrievers.multi_query import MultiQueryRetriever
@@ -47,9 +52,13 @@ nlp = spacy.load("en_core_web_sm")  # For NER
 embedding_model = OpenAIEmbeddings(api_key=settings.OPENAI_API_KEY)
 llm = ChatOpenAI(api_key=settings.OPENAI_API_KEY,temperature=0)
 
-# Connect to Qdrant
-qdrant_client = QdrantClient(host="localhost", port=6333)
-collection_name = "xamplify_docs"
+# Connect to Qdrant (cloud)
+qdrant_client = QdrantClient(
+    url=settings.QDRANT_URL,
+    api_key=settings.QDRANT_API_KEY,
+    timeout=600.0  # seconds: increase to handle large bulk uploads without timing out
+)
+collection_name = settings.QDRANT_COLLECTION_NAME
 
 
 
@@ -141,11 +150,8 @@ def extract_text_from_file(file_path: str, original_file_name: str) -> str:
         extracted_data = extract_text_from_pptx(file_path)
     
     elif ext in [".xls", ".xlsx", ".csv"]:
-        extracted_data = extract_structured_from_excel_or_csv(file_path)
-        if isinstance(extracted_data, dict):
-            extracted_data = json.dumps(extracted_data)  # Convert to JSON string if dict
-        elif isinstance(extracted_data, list):
-            extracted_data = '\n'.join([json.dumps(item) for item in extracted_data])  # Convert list of dicts to string
+        # Read tabular data as a formatted table string
+        extracted_data = extract_text_from_excel_or_csv(file_path)
     
     elif ext == ".txt":
         extracted_data = extract_text_from_txt(file_path)
@@ -396,24 +402,29 @@ def extract_text_from_ppt(file_path: str) -> str:
         if os.path.exists(pptx_path):
             os.remove(pptx_path)
 # 4. Excel/CSV
-def extract_text_from_excel_or_csv(path):
+def extract_text_from_excel_or_csv(path: str) -> str:
+    """
+    Read an Excel (.xls/.xlsx) or CSV file and return a human-readable table
+    (markdown format if possible, otherwise plain text).
+    """
     ext = Path(path).suffix.lower()
-
     if ext == ".csv":
-        df = pd.read_csv(path)
-    elif ext == ".xlsx":
-        xls = pd.ExcelFile(path, engine="openpyxl")
-        dfs = [xls.parse(sheet_name) for sheet_name in xls.sheet_names]
-        df = pd.concat(dfs, keys=xls.sheet_names)
-    elif ext == ".xls":
-        xls = pd.ExcelFile(path, engine="xlrd")
-        dfs = [xls.parse(sheet_name) for sheet_name in xls.sheet_names]
-        df = pd.concat(dfs, keys=xls.sheet_names)
+        # Read CSV into DataFrame and return as CSV text
+        try:
+            df = read_csv_with_encoding_fallback(path)
+        except NameError:
+            df = pd.read_csv(path)
+        return df.to_csv(index=False)
+    elif ext in [".xlsx", ".xls"]:
+        # Read first sheet of Excel and return as CSV text
+        try:
+            df = pd.read_excel(path, sheet_name=0)
+        except Exception:
+            # Fallback to specific engine
+            df = pd.read_excel(path, sheet_name=0, engine="openpyxl")
+        return df.to_csv(index=False)
     else:
-        raise ValueError("Unsupported Excel/CSV file extension!")
-
-    # Convert dataframe to markdown-like format
-    return df.to_string(index=False)
+        raise ValueError("Unsupported Excel/CSV file extension for table extraction.")
 
 # 4. Structured Excel/CSV (NEW)
 def read_csv_with_encoding_fallback(path):
@@ -577,8 +588,10 @@ def insert_document_to_vectorstore(text: str, source_type: str, file_ext: str,ve
     print(f"[+] Splitting text into {len(docs)} chunks...")
 
     # Extract global metadata once for the whole file
+    # Extract metadata (including file_ext) and persist vector_id
     global_metadata = extract_metadata(text, file_ext)
-    global_metadata["vector_id"] = vector_id  # Add vector_id to metadata
+    global_metadata["vector_id"] = vector_id
+    global_metadata["file_ext"] = file_ext
 
 
     # Merge the global metadata into each document's metadata
@@ -588,14 +601,21 @@ def insert_document_to_vectorstore(text: str, source_type: str, file_ext: str,ve
         doc.metadata.update(global_metadata)
 
 
-    if source_type == "file":
-        print(f"[+] Inserting {len(docs)} chunks into Qdrant... as file")
-        qdrant.add_documents(docs, batch_size=64)
-    elif source_type == "integration":
-        print(f"[+] Inserting {len(docs)} chunks into Qdrant... as integration")
-        qdrant.add_documents(docs, batch_size=64)
-    else:
-        raise ValueError("Invalid source_type")
+    if source_type not in ("file", "integration"):
+        raise ValueError(f"Invalid source_type '{source_type}'")
+    # Batch upload to Qdrant with progress logs
+    batch_size = 64
+    total_docs = len(docs)
+    batches = [docs[i:i+batch_size] for i in range(0, total_docs, batch_size)]
+    total_batches = len(batches)
+    print(f"[+] Inserting {total_docs} chunks into Qdrant in {total_batches} batches...")
+    for idx, batch in enumerate(batches):
+        try:
+            qdrant.add_documents(batch, batch_size=len(batch))
+        except Exception as e:
+            print(f"[!] Failed to insert batch {idx+1}/{total_batches}: {e}")
+            raise
+        print(f"[+] Uploaded batch {idx+1}/{total_batches}")
 
     
 
@@ -609,24 +629,37 @@ def split_text_into_chunks(text: str, chunk_size=1000, chunk_overlap=200):
 
 
 
-def split_csv_rows(text: str, max_lines_per_chunk=50):
-    lines = text.strip().split("\n")
-    if len(lines) == 0:
+# Split CSV/Excel table text into one row per document, preserving headers
+def split_csv_rows(text: str) -> list:
+    # Split into non-empty lines
+    lines = [l for l in text.strip().split("\n") if l.strip()]
+    if not lines:
         print("[!] No lines found in CSV text.")
         return []
-    header = lines[0]
-    data_lines = lines[1:]
-
-    if len(data_lines) == 0:
-        print("[!] No data lines found, only header.")
+    # Detect header row: prefer markdown-style '|col|' or simple first line
+    header = None
+    data_start = 1
+    for idx, l in enumerate(lines):
+        if l.strip().startswith("|") and l.count("|") >= 2:
+            header = l.strip()
+            data_start = idx + 1
+            break
+    if not header:
+        header = lines[0].strip()
+        data_start = 1
+    # Exclude any sheet headers or separators (like lines starting with '#')
+    data_lines = [l for l in lines[data_start:] if not l.strip().startswith('#')]
+    if not data_lines:
+        print("[!] No data lines found after header.")
         return []
-
-    chunks = []
-    for i in range(0, len(data_lines), max_lines_per_chunk):
-        chunk_text = "\n".join([header] + data_lines[i:i + max_lines_per_chunk])
-        chunks.append(LangChainDocument(page_content=chunk_text, metadata={"chunk": i // max_lines_per_chunk + 1}))
-    print(f"[+] Created {len(chunks)} chunks from CSV rows.")
-    return chunks
+    docs = []
+    for i, row in enumerate(data_lines):
+        row = row.strip()
+        chunk_text = f"{header}\n{row}"
+        md = {"chunk": i + 1}
+        docs.append(LangChainDocument(page_content=chunk_text, metadata=md))
+    print(f"[+] Split CSV/Excel into {len(docs)} row-level documents.")
+    return docs
 
 def split_unstructured_text(text: str, chunk_size=1000, chunk_overlap=200):
     if len(text.strip()) == 0:
@@ -688,6 +721,167 @@ def smart_split_text(text: str, file_ext: str):
         docs = split_unstructured_text(text)
         print(f"[+] Split into {len(docs)} documents.")
         return docs
+
+def handle_table_query(csv_text: str, question: str):
+    """
+    Perform NLP-driven queries on tabular CSV/Excel data.
+    Supports patterns like:
+      - how many <target> from/in <value>
+      - give me <target> from/in <value>
+    Uses fuzzy matching for target column names and value matching for filtering.
+    Returns a string answer, or None if parsing/matching fails.
+    """
+    try:
+        df = pd.read_csv(StringIO(csv_text))
+        ql = question.strip().lower()
+        # Numeric filter support: e.g. 'companies with more than 3000 employees'
+        # Support patterns like 'X [from Y]? with more than N Z'
+        num_pattern = r"(?P<target>[\w\s]+?)(?:\s+from\s+[\w\s]+?)?\s+with\s+(?:more|greater|over)\s+than\s+(?P<number>\d+)\s+(?P<num_field>[\w\s]+)"
+        mnum = re.search(num_pattern, ql)
+        if mnum:
+            target_raw = mnum.group('target').strip().lower()
+            num_value = int(mnum.group('number'))
+            num_field_raw = mnum.group('num_field').strip().lower()
+            # Detect location if present
+            location_raw = None
+            # Extract location up to 'with'
+            mloc = re.search(r"(?:from|in)\s+(?P<loc>[\w\s]+?)(?=\s+with|$)", ql)
+            if mloc:
+                location_raw = mloc.group('loc').strip().lower()
+            # Handle demonyms like 'srilankan'
+            elif 'sri lanka' in ql or 'srilankan' in ql:
+                location_raw = 'sri lanka'
+            # Fuzzy match target column
+            cols = df.columns.tolist()
+            cols_low = [c.lower() for c in cols]
+            # Map generic queries for company/organization names to a likely name column
+            synonyms = ['company', 'companies', 'organization', 'organizations', 'org', 'orgs', 'firm', 'firms', 'name']
+            if any(syn in target_raw for syn in synonyms):
+                # pick the first column containing name-like text
+                name_cols = [c for c in cols if any(k in c.lower() for k in ['name','company','org','firm'])]
+                tgt_col = name_cols[0] if name_cols else None
+            else:
+                # fuzzy match target column
+                fm_tgt = difflib.get_close_matches(target_raw, cols_low, n=1, cutoff=0.3)
+                if fm_tgt:
+                    tgt_col = cols[cols_low.index(fm_tgt[0])]
+                else:
+                    tgt_col = next((cols[i] for i,c in enumerate(cols_low)
+                                    if target_raw in c or c in target_raw), None)
+            # Fuzzy match numeric field column
+            fm_num = difflib.get_close_matches(num_field_raw, cols_low, n=1, cutoff=0.3)
+            if fm_num:
+                num_col = cols[cols_low.index(fm_num[0])]
+            else:
+                num_col = next((cols[i] for i,c in enumerate(cols_low)
+                                if num_field_raw in c or c in num_field_raw), None)
+            # Find location column
+            filt_col = None
+            if location_raw:
+                # try common names first
+                filt_col = next((c for c in cols if 'country' in c.lower()), None)
+                if not filt_col:
+                    # fuzzy match location field
+                    fm_loc = difflib.get_close_matches(location_raw, cols_low, n=1, cutoff=0.3)
+                    if fm_loc:
+                        filt_col = cols[cols_low.index(fm_loc[0])]
+            # Build mask
+            mask = pd.Series([True] * len(df))
+            if location_raw and filt_col:
+                mask &= df[filt_col].astype(str).str.lower().str.contains(location_raw, regex=False)
+            # Numeric comparison
+            if num_col:
+                try:
+                    num_series = pd.to_numeric(df[num_col], errors='coerce')
+                    mask &= num_series > num_value
+                except Exception:
+                    pass
+            if not tgt_col:
+                return None
+            # Extract full rows for matching mask
+            records = df.loc[mask].dropna(how='all').to_dict(orient='records')
+            if ql.startswith('how many'):
+                return str(len(records))
+            return records
+        # end numeric filter
+        # --- continue standard pattern parsing ---
+        # Parse intent: action, target column name, filter value
+        m = re.search(
+            r"(?:how many|give me|list|show me|what are)\s+"     # action
+            r"(?P<target>[\w\s]+?)\s+"                         # target field
+            r"(?:are\s+)?(?:from|in)\s+"                       # preposition
+            r"(?P<value>[\w\s]+)",                            # filter value
+            ql
+        )
+        if not m:
+            return None
+        target_raw = m.group('target').strip().lower()
+        # Normalize 'names of X' to 'X'
+        for prefix in ['names of ', 'name of ', 'names for ', 'name for ']:
+            if target_raw.startswith(prefix):
+                target_raw = target_raw[len(prefix):].strip()
+                break
+        value_raw = m.group('value').strip().lower()
+        # Prepare columns for matching
+        cols = df.columns.tolist()
+        cols_low = [c.lower() for c in cols]
+        # Map generic terms to name column for organization/company queries
+        synonyms = ['company', 'companies', 'organization', 'organizations', 'org', 'orgs', 'firm', 'firms']
+        if target_raw in synonyms:
+            # pick the first text column likely holding names
+            name_cols = [c for c in cols if any(k in c.lower() for k in ['name', 'company', 'org', 'firm'])]
+            if name_cols:
+                tgt_col = name_cols[0]
+                # Identify filter column for location
+                filt_col = next((c for c in cols if any(k in c.lower() for k in ['country', 'location', 'region'])), None)
+                if not filt_col:
+                    for c in cols:
+                        try:
+                            if df[c].astype(str).str.lower().str.contains(value_raw, regex=False).any():
+                                filt_col = c; break
+                        except Exception:
+                            continue
+                if not filt_col:
+                    return None
+                mask = df[filt_col].astype(str).str.lower().str.contains(value_raw, regex=False)
+                results = df.loc[mask, tgt_col].dropna().unique().tolist()
+                if ql.startswith('how many'):
+                    return str(len(results))
+                return ', '.join(map(str, results))
+        # Match target column via fuzzy match + substring
+        cols = df.columns.tolist()
+        cols_low = [c.lower() for c in cols]
+        # Fuzzy match
+        # Fuzzy match target column, relax cutoff and allow singular/plural match
+        fm = difflib.get_close_matches(target_raw, cols_low, n=1, cutoff=0.3)
+        if fm:
+            tgt_col = cols[cols_low.index(fm[0])]
+        else:
+            # Fallback to substring match in either direction
+            tgt_col = next((cols[i] for i,c in enumerate(cols_low)
+                            if target_raw in c or c in target_raw), None)
+        if not tgt_col:
+            return None
+        # Identify filter column: country/location
+        filt_col = next((c for c in cols if any(k in c.lower() for k in ['country', 'location', 'region'])), None)
+        if not filt_col:
+            for c in cols:
+                try:
+                    if df[c].astype(str).str.lower().str.contains(value_raw, regex=False).any():
+                        filt_col = c; break
+                except Exception:
+                    continue
+        if not filt_col:
+            return None
+        # Filter rows
+        mask = df[filt_col].astype(str).str.lower().str.contains(value_raw, regex=False)
+        # Return full rows for matching
+        records = df.loc[mask].dropna(how='all').to_dict(orient='records')
+        if ql.startswith('how many'):
+            return str(len(records))
+        return records
+    except Exception:
+        return None
 
 
 
@@ -864,6 +1058,36 @@ def ask_question_for_single_document(query: str, source_type: str, documents: Op
             print(f"[+] Built memory context with {len(memory_pairs)} turns")
 
         if documents:
+            # If this document is a table (Excel/CSV), use a Pandas DataFrame agent for QA
+            file_ext = documents[0].get("metadata", {}).get("file_ext", "")
+            # If this document is a table (CSV/Excel), try simple table query
+            if file_ext in [".csv", ".xls", ".xlsx"]:
+                # Try structured table query first
+                from .utils import handle_table_query, llm
+                # Reconstruct full CSV text
+                rows = []
+                header = None
+                for d in documents:
+                    parts = d.get("content", "").split("\n", 1)
+                    if header is None and parts:
+                        header = parts[0]
+                    if len(parts) > 1:
+                        rows.append(parts[1])
+                csv_text = header + "\n" + "\n".join(rows)
+                table_res = handle_table_query(csv_text, query)
+                if table_res is not None:
+                    return table_res
+                # Fallback: use DataFrame agent for large tables
+                try:
+                    from io import StringIO
+                    import pandas as pd
+                    from langchain_experimental.agents import create_pandas_dataframe_agent
+                    df = pd.read_csv(StringIO(csv_text))
+                    agent = create_pandas_dataframe_agent(llm, df, verbose=False)
+                    return agent.run(query)
+                except Exception as e:
+                    print(f"[!] DataFrame agent failed for table fallback: {e}")
+            # Continue with vector retrieval for non-table or fallback
             print("[+] Using provided documents as context")
             vector_id = documents[0]["metadata"]["vector_id"]
             filter = Filter(
@@ -978,14 +1202,28 @@ def ask_question(query: str, source_type: str, documents: Optional[List[dict]] =
             memory_context = "\n".join(memory_pairs)
 
         if documents:
+            # If this is a table (CSV/Excel), use handle_table_query for full table QA
+            if all(d.get("metadata", {}).get("file_ext") in [".csv", ".xls", ".xlsx"] for d in documents):
+                from .utils import handle_table_query
+                # Reconstruct CSV text: header + all rows
+                rows = []
+                header = None
+                for d in documents:
+                    parts = d.get("content", "").split("\n", 1)
+                    if header is None and parts:
+                        header = parts[0]
+                    if len(parts) > 1:
+                        rows.append(parts[1])
+                csv_text = header + "\n" + "\n".join(rows)
+                table_ans = handle_table_query(csv_text, query)
+                if table_ans is not None:
+                    return table_ans
             print("[+] Using provided documents as context")
             # Group documents by vector_id (i.e., per file)
             grouped_docs = {}
             for doc in documents:
-                vector_id = doc["metadata"].get("vector_id", "unknown")
-                if vector_id not in grouped_docs:
-                    grouped_docs[vector_id] = []
-                grouped_docs[vector_id].append(doc)
+                vector_id = doc.get("metadata", {}).get("vector_id", "unknown")
+                grouped_docs.setdefault(vector_id, []).append(doc)
 
             print(f"[+] Grouped into {len(grouped_docs)} files for summarization")
 
@@ -1166,7 +1404,7 @@ def retrieve_documents_by_vector_id(vector_id: str) -> list:
         search_result = qdrant_client.scroll(
             collection_name=collection_name,
             scroll_filter=filter,
-            limit=100,  # Adjust based on expected number of chunks
+            limit=1000,  # Increase to support large tables with many rows
             with_vectors=False,
             with_payload=True
         )
@@ -1300,7 +1538,7 @@ def retrieve_documents_by_vector_ids(vector_ids: List[str]) -> list:
         search_result = qdrant_client.scroll(
             collection_name=collection_name,
             scroll_filter=filter,
-            limit=300,
+            limit=1000,  # Increase to support large tables with many rows
             with_vectors=False,
             with_payload=True
         )

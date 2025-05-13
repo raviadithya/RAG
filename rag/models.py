@@ -77,3 +77,14 @@ class DocumentAccess(models.Model):
 
     class Meta:
         unique_together = ('document', 'user_identifier')
+
+# Persist a copy of each ingested document in an external SQL database for direct queries
+class ExternalDocument(models.Model):
+    vector_id = models.CharField(max_length=36, unique=True)
+    title = models.CharField(max_length=255)
+    content = models.TextField()
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'external_documents'
+        # existing DocumentAccess does not route to external DB
